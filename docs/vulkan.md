@@ -295,7 +295,7 @@ existing asynchronous submission path.
 Set `WWHD_VK_DRAW_BATCH=0` to disable mid-frame batching, or set an explicit
 positive draw count to tune it. Empty or invalid values disable batching.
 `WWHD_VK_DRAW_BATCH_CAP=1|2|3` sets the maximum mid-frame submissions (default three).
-See `docs/performance.md` for the local Windows comparison.
+See the [historical Windows comparison](https://github.com/endercodezz/ZeldaWWHDRecomp-Deck/blob/5a8d06055906b46eed2a39c99cf24b91a7acc355/docs/performance.md) (not a Steam Deck benchmark).
 
 ## macOS defaults and tuning
 
