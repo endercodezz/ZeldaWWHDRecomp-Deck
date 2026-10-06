@@ -439,6 +439,10 @@ static Shader* get_shader_uncached(const uint32_t* regs, bool vertex, LatteFetch
     double t0 = now_ms();
     LatteShader_UpdatePSInputs((uint32*)regs);
     LatteDecompilerOptions opt;
+    // the GPU's MUL/MULADD give 0*anything=0 (rsqrt(0)*0 is NaN otherwise: black letter in the Rito
+    // mail sorting game); Cemu's default too. WWHD_STRICT_MUL=0 turns it off for comparisons
+    static const bool strictMul = !getenv("WWHD_STRICT_MUL") || strcmp(getenv("WWHD_STRICT_MUL"), "0");
+    opt.strictMul = strictMul;
     LatteDecompilerOutput_t out{};
     if (vertex)
         LatteDecompiler_DecompileVertexShader(base, (uint32*)regs, mem::ptr(addr), size, fs, opt, &out);

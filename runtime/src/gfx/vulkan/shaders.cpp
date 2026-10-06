@@ -399,6 +399,10 @@ Shader* translate(const uint32_t* regs, bool vertex, LatteFetchShader* fetch, ui
     if (vertex && !fetch) { shader->error = "vertex shader has no fetch program"; return shader; }
     LatteShader_UpdatePSInputs(const_cast<uint32_t*>(regs));
     LatteDecompilerOptions options;
+    // the GPU's MUL/MULADD give 0*anything=0 (rsqrt(0)*0 is NaN otherwise: black letter in the Rito
+    // mail sorting game); Cemu's default too. WWHD_STRICT_MUL=0 turns it off for comparisons
+    static const bool strictMul = !getenv("WWHD_STRICT_MUL") || strcmp(getenv("WWHD_STRICT_MUL"), "0");
+    options.strictMul = strictMul;
     LatteDecompilerOutput_t output{};
     if (vertex) LatteDecompiler_DecompileVertexShader(base, const_cast<uint32_t*>(regs),
         ppc_ptr(address), size, fetch, options, &output);
