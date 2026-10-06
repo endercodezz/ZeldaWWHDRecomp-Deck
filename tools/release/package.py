@@ -63,6 +63,44 @@ update, change the game or import saves. The same setup in a terminal: tools/Set
 
 This file marks the folder as portable; without it, setup uses the per-user folders of earlier releases.
 """
+DECK_START = """ZeldaWWHDRecomp-Deck - Steam Deck LCD / OLED (SteamOS, Linux x86-64)
+
+1. Extract this whole folder into a writable location in Desktop Mode.
+2. Open wind-waker-hd (or Wind Waker HD.desktop). If permissions were lost,
+   mark wind-waker-hd and tools/setup-in-terminal.sh executable in Properties.
+3. Choose your own USA version-0 game dump: an extracted code/content/meta
+   folder, a .wua archive, or .wud/.wux plus your own disc and common keys.
+   A raw RPX alone is insufficient. No game files or keys are supplied.
+4. Setup downloads a verified compiler, recompiles your game and links it with
+   the included runtime. Internet access and free disk space are needed during
+   setup. You do not need to install a compiler or unlock the SteamOS root.
+5. Press Play. Later starts of wind-waker-hd launch the prepared game directly.
+   Add that same executable as a non-Steam game, without forcing Proton.
+
+New installations start with 60 FPS interpolation (30 Hz game logic), 1x
+resolution, FIFO/VSync and GamePad picture-in-picture. Settings remain editable
+in the F1 overlay (or hold Select). Existing settings are preserved on repair.
+Set fullscreen and 16:10 in the overlay for the Deck's 1280x800 display.
+Stable 60 FPS and suspend/resume still need validation on real Deck hardware.
+
+Everything generated stays in data/: executable in data/bin/wwhd, saves in
+data/save, settings and caches in data/user. Extracted game folders are used
+in place: keep them available. Back up saves before updating.
+Run wind-waker-hd --setup to repair/update or select a different dump.
+Terminal fallback: tools/setup-in-terminal.sh
+
+Maintained by endercodezz, based on ZeldaWWHDRecomp and its contributors.
+See LICENSE and third-party-licenses. Do not redistribute your generated game.
+"""
+
+
+def deck_manifest(platform):
+    if platform != "linux-x86_64":
+        raise ValueError("Steam Deck packages require linux-x86_64")
+    return {"profile": "steam-deck", "default_settings": {
+        "fps60": "1", "resScale": "1", "vkPresentMode": "0", "drcMode": "pip"}}
+
+
 MAC_SETUP_PLIST = """<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -295,10 +333,16 @@ def main():
     ap.add_argument("--linkonly-lib", action="append", default=[], help="system library to ship for linking only")
     ap.add_argument("--setup-gui", help="the built graphical installer (wwhd-setup) to include")
     ap.add_argument("--no-zip", action="store_true")
+    ap.add_argument("--steam-deck", action="store_true", help="Steam Deck package identity and first-install settings")
     a = ap.parse_args()
+
+    if a.steam_deck and (a.platform != "linux-x86_64" or not a.setup_gui):
+        ap.error("--steam-deck requires --platform linux-x86_64 and --setup-gui")
 
     build = os.path.abspath(a.build)
     name = "WindWakerHD-%s-%s" % (a.version, a.platform)
+    if a.steam_deck:
+        name = "ZeldaWWHDRecomp-Deck-%s-steamdeck-x86_64" % a.version
     pkg = os.path.join(os.path.abspath(a.out), name)
     if os.path.exists(pkg):
         shutil.rmtree(pkg)
@@ -327,6 +371,8 @@ def main():
         "link": link,
         "runtime_files": runtime_files,
     }
+    if a.steam_deck:
+        manifest.update(deck_manifest(a.platform))
     with open(os.path.join(pkg, "sdk", "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=1)
 
@@ -357,7 +403,11 @@ def main():
         copy(os.path.join(inst, "install-linux.sh"), os.path.join(pkg, "tools", "setup-in-terminal.sh"))
     # portable release: everything stays in this folder (setup.py and the game look for this file)
     with open(os.path.join(pkg, "portable.txt"), "w") as f:
-        f.write(PORTABLE_TXT)
+        f.write(DECK_START if a.steam_deck else PORTABLE_TXT)
+
+    if a.steam_deck:
+        with open(os.path.join(pkg, "START-HERE.txt"), "w", encoding="utf-8") as f:
+            f.write(DECK_START)
 
     if a.setup_gui:
         add_setup_gui(pkg, a.platform, a.setup_gui, a.version)

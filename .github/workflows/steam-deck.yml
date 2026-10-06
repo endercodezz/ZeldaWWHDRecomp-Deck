@@ -1,0 +1,220 @@
+# Based on upstream's portable Linux release pipeline. CI never receives game files.
+# Runtime objects are built with the same pinned compiler the Deck installer downloads.
+name: Steam Deck package
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: steam-deck-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  SDL3_URL: https://github.com/libsdl-org/SDL/releases/download/release-3.4.18/SDL3-3.4.18.tar.gz
+  SDL3_SHA256: 9c75cf16330322c217dedd2e0609f1124f1b54b8633e763467b4684d0f4334a3
+  VULKAN_HEADERS_URL: https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/v1.4.363.tar.gz
+  VULKAN_HEADERS_SHA256: cbaf687d3c59b9666fe080e7f8396b6b4f4d344a768ee6b337c59852f4526b68
+
+jobs:
+  package:
+    # Build on glibc 2.35 for SteamOS compatibility. Hardware validation remains separate.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    env:
+      ARCH: x86_64
+      TOOLCHAIN: zig-0.16.0
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Package version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "VERSION=$GITHUB_REF_NAME" >> "$GITHUB_ENV"
+          else
+            echo "VERSION=dev-${GITHUB_SHA::12}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          # SDL3's documented Linux build dependencies (SDL3 docs/README-linux.md, Ubuntu 22.04+ set), so
+          # the shipped SDL3 has every backend (X11, Wayland, PipeWire/PulseAudio/ALSA, input, IME);
+          # libvulkan1 is only linked against (players use their own Vulkan loader)
+          sudo apt-get install -y build-essential cmake ninja-build pkg-config xz-utils libvulkan1 \
+            libasound2-dev libpulse-dev libaudio-dev libfribidi-dev libjack-dev libsndio-dev \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev libxi-dev libxss-dev \
+            libxtst-dev libxkbcommon-dev libdrm-dev libgbm-dev libgl1-mesa-dev libgles2-mesa-dev \
+            libegl1-mesa-dev libdbus-1-dev libibus-1.0-dev libudev-dev libthai-dev libusb-1.0-0-dev \
+            libpipewire-0.3-dev libwayland-dev libdecor-0-dev liburing-dev wayland-protocols \
+            mesa-vulkan-drivers xvfb
+
+      - name: Pinned zig toolchain (tools/installer/toolchains.json)
+        run: |
+          read -r URL SUM DIR TARGET < <(python3 -c "
+          import json, os; t=json.load(open('tools/installer/toolchains.json'))['toolchains'][os.environ['TOOLCHAIN']]
+          print(t['url'], t['sha256'], t['dir'], t['target'])")
+          echo "ZIG_DIR=$RUNNER_TEMP/$DIR" >> "$GITHUB_ENV"
+          curl -fsSL -o "$RUNNER_TEMP/zig.tar.xz" "$URL"
+          echo "$SUM  $RUNNER_TEMP/zig.tar.xz" | sha256sum -c -
+          tar -xf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP"
+          ZIG="$RUNNER_TEMP/$DIR/zig"
+          mkdir -p "$RUNNER_TEMP/zbin"
+          printf '#!/bin/sh\nexec "%s" cc -target %s "$@"\n' "$ZIG" "$TARGET" > "$RUNNER_TEMP/zbin/zcc"
+          printf '#!/bin/sh\nexec "%s" c++ -target %s "$@"\n' "$ZIG" "$TARGET" > "$RUNNER_TEMP/zbin/zcxx"
+          printf '#!/bin/sh\nexec "%s" ar "$@"\n' "$ZIG" > "$RUNNER_TEMP/zbin/zar"
+          printf '#!/bin/sh\nexec "%s" ranlib "$@"\n' "$ZIG" > "$RUNNER_TEMP/zbin/zranlib"
+          chmod +x "$RUNNER_TEMP"/zbin/*
+          echo "ZBIN=$RUNNER_TEMP/zbin" >> "$GITHUB_ENV"
+          echo "ZIG_GLOBAL_CACHE_DIR=$RUNNER_TEMP/zig-cache" >> "$GITHUB_ENV"
+
+      - name: SDL3 (shared library, system compiler, shipped next to the game)
+        run: |
+          curl -fsSL -o sdl3.tar.gz "$SDL3_URL"
+          echo "$SDL3_SHA256  sdl3.tar.gz" | sha256sum -c -
+          tar -xzf sdl3.tar.gz
+          cmake -S SDL3-3.4.18 -B sdl3-build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSDL_SHARED=ON -DSDL_STATIC=OFF \
+            -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF -DCMAKE_INSTALL_PREFIX="$HOME/sdl3"
+          cmake --build sdl3-build --parallel 2
+          cmake --install sdl3-build
+
+      - name: Vulkan headers
+        run: |
+          curl -fsSL -o vh.tar.gz "$VULKAN_HEADERS_URL"
+          echo "$VULKAN_HEADERS_SHA256  vh.tar.gz" | sha256sum -c -
+          mkdir -p "$HOME/vulkan" && tar -xzf vh.tar.gz -C "$HOME/vulkan" --strip-components=1
+
+      - name: Build runtime (Release, Vulkan + SDL3) with zig against placeholder guest code
+        run: |
+          python3 tools/recomp/stubgen.py build/gen-stub
+          cmake -S . -B build/rel -G Ninja -DCMAKE_BUILD_TYPE=Release -DGEN_DIR="$PWD/build/gen-stub" \
+            -DCMAKE_C_COMPILER="$ZBIN/zcc" -DCMAKE_CXX_COMPILER="$ZBIN/zcxx" \
+            -DCMAKE_AR="$ZBIN/zar" -DCMAKE_RANLIB="$ZBIN/zranlib" \
+            -DWWHD_RENDERER=VULKAN -DWWHD_BUNDLED_DEPS=ON -DCMAKE_PREFIX_PATH="$HOME/sdl3" -DWWHD_SETUP_GUI=ON \
+            -DVulkan_INCLUDE_DIR="$HOME/vulkan/include" \
+            -DVulkan_LIBRARY="/usr/lib/$ARCH-linux-gnu/libvulkan.so.1"
+          cmake --build build/rel --parallel 2
+
+      - name: Unit tests
+        run: |
+          export LD_LIBRARY_PATH="$HOME/sdl3/lib"
+          ctest --test-dir build/rel --output-on-failure
+          python3 tools/installer/test_setup.py
+          python3 tools/release/test_package.py
+
+      - name: Package
+        run: |
+          python3 tools/release/package.py --build build/rel --platform "linux-$ARCH" --steam-deck --version "$VERSION" \
+            --out dist --toolchain "$TOOLCHAIN" --setup-gui build/rel/wwhd-setup \
+            --runtime-file "$HOME/sdl3/lib/libSDL3.so.0" \
+            --linkonly-lib "/usr/lib/$ARCH-linux-gnu/libvulkan.so.1" \
+            --license "SDL3 (zlib)=$PWD/SDL3-3.4.18/LICENSE.txt" \
+            --license "Vulkan-Headers (Apache-2.0)=$HOME/vulkan/LICENSE.md" \
+            --license "glslang (BSD-3-Clause and others)=$PWD/build/rel/_deps/glslang-src/LICENSE.txt" \
+            --license "zlib (zlib)=$PWD/build/rel/_deps/zlib-src/LICENSE" \
+            --license "LZ4 (BSD-2-Clause)=$PWD/build/rel/_deps/lz4-src/lib/LICENSE" \
+            --license "LLVM libc++ (Apache-2.0 WITH LLVM-exception)=$ZIG_DIR/lib/libcxx/LICENSE.TXT"
+
+      - name: Guard (no game code, game files or keys)
+        run: python3 tools/release/guard.py dist/*.zip
+
+      - name: Installer self-test (unzipped release, placeholder code, toolchain download)
+        run: |
+          mkdir -p "$RUNNER_TEMP/unz" && cd "$RUNNER_TEMP/unz" && unzip -q "$GITHUB_WORKSPACE"/dist/*.zip
+          cd ZeldaWWHDRecomp-Deck-*
+          ./tools/setup-in-terminal.sh --yes --no-launch --gen-dir "$GITHUB_WORKSPACE/build/gen-stub" --data-dir "$RUNNER_TEMP/data"
+          # the right architecture: the game the installer linked and the program a player starts
+          want=$([ "$ARCH" = aarch64 ] && echo "ARM aarch64" || echo "x86-64")
+          file "$RUNNER_TEMP/data/bin/wwhd" ./wind-waker-hd
+          file "$RUNNER_TEMP/data/bin/wwhd" | grep -q "$want"
+          file ./wind-waker-hd | grep -q "$want"
+          ldd "$RUNNER_TEMP/data/bin/wwhd"
+          "$RUNNER_TEMP/data/bin/wwhd" --game "$RUNNER_TEMP/nogame" > run.log 2>&1 || true
+          cat run.log
+          grep -q "cannot load" run.log
+          ldd ./wind-waker-hd
+          SDL_VIDEO_DRIVER=offscreen ./wind-waker-hd --self-test --data-dir "$RUNNER_TEMP/data"
+
+      - name: Checksums
+        run: cd dist && sha256sum *.zip > SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: steam-deck-package
+          path: |
+            dist/*.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  verify:
+    needs: package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: steam-deck-package
+          path: dist
+      - name: Install software Vulkan test environment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers vulkan-validationlayers xvfb
+      - name: Verify archive and install from the downloadable package
+        run: |
+          (cd dist && sha256sum -c SHA256SUMS.txt)
+          python3 tools/release/guard.py dist/*.zip
+          python3 tools/recomp/stubgen.py build/gen-stub
+          mkdir -p "$RUNNER_TEMP/unz"
+          unzip -q dist/*.zip -d "$RUNNER_TEMP/unz"
+          cd "$RUNNER_TEMP"/unz/ZeldaWWHDRecomp-Deck-*
+          ./tools/setup-in-terminal.sh --yes --no-launch --gen-dir "$GITHUB_WORKSPACE/build/gen-stub" \
+            --data-dir "$RUNNER_TEMP/data"
+          SDL_VIDEO_DRIVER=offscreen ./wind-waker-hd --self-test --data-dir "$RUNNER_TEMP/data"
+      - name: Installed renderer smoke test (lavapipe + validation, required)
+        env:
+          WWHD_VK_VALIDATION: '1'
+          VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+        run: |
+          set -o pipefail
+          xvfb-run -a -s '-screen 0 1280x800x24' "$RUNNER_TEMP/data/bin/wwhd" --renderer-smoke 2>&1 | tee smoke.log
+          grep -q PASS smoke.log
+          ! grep -q VUID smoke.log
+      - name: Download instructions
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          ## Steam Deck package checked
+          Download **steam-deck-package** from this run's Artifacts and extract the enclosed ZIP.
+          On Deck, open `wind-waker-hd` in Desktop Mode, choose your own USA version-0 dump,
+          and let setup compile it locally. See the enclosed `START-HERE.txt`.
+          CI uses placeholder game code: this checks installation and software Vulkan, not gameplay or 60 FPS on Deck.
+          EOF
+
+  publish:
+    needs: [package, verify]
+    if: startsWith(github.ref, 'refs/tags/v') && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: steam-deck-package
+          path: dist
+      - name: Publish Steam Deck release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 tools/release/guard.py dist/*.zip
+          python3 tools/release/notes.py README.md "$GITHUB_REF_NAME" dist/SHA256SUMS.txt > dist/notes.md
+          gh release create "$GITHUB_REF_NAME" dist/*.zip dist/SHA256SUMS.txt \
+            --title "ZeldaWWHDRecomp-Deck $GITHUB_REF_NAME" --notes-file dist/notes.md --verify-tag

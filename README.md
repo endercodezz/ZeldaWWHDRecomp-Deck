@@ -19,7 +19,15 @@ The baseline approach is inherited **60 FPS interpolation**, which keeps the ori
 
 ## Status
 
-Early and experimental. Stable 60 FPS, battery efficiency and suspend/resume on LCD/OLED have not been verified here. Automatic Deck detection and Deck-specific defaults are not implemented yet. The inherited Linux defaults still select native 30 FPS; this cleanup changes documentation and agent workflows only.
+Early and experimental. Stable 60 FPS, battery efficiency and suspend/resume on LCD/OLED have not been verified here. Fresh Deck package installations select interpolated 60 FPS, 1× rendering, FIFO and GamePad picture-in-picture; existing settings are preserved. Source builds retain inherited defaults. Hardware detection is not implemented.
+
+## Download for Steam Deck
+
+1. Get the Steam Deck ZIP from [Releases](https://github.com/endercodezz/ZeldaWWHDRecomp-Deck/releases), or open a successful [Steam Deck package run](https://github.com/endercodezz/ZeldaWWHDRecomp-Deck/actions/workflows/steam-deck.yml) and download **steam-deck-package** under Artifacts (GitHub sign-in required). Extract the artifact and its enclosed game-package ZIP.
+2. On Deck in Desktop Mode, open `wind-waker-hd`. Choose your own **USA version-0** game: `.wua`, an extracted `code/content/meta` folder, or `.wud`/`.wux` with your own keys. A raw RPX alone is insufficient.
+3. Setup downloads a verified compiler and builds the game locally. Press **Play**, then add `wind-waker-hd` as a non-Steam game without forcing Proton. Later launches start the prepared game directly.
+
+No development tools or changes to SteamOS's read-only root are needed. Keep the whole package folder; saves/settings live in `data/`. See `START-HERE.txt` inside the archive. CI tests installation with placeholder code; it cannot verify gameplay from a real dump.
 
 ## Building / Running
 

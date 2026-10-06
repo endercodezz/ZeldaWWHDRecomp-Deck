@@ -4,6 +4,8 @@ Target: LCD/OLED on SteamOS, Linux x86-64, RADV Vulkan and Gamescope. Stable 60 
 
 ## Build dependencies
 
+For a downloadable package, follow [Download for Steam Deck](../README.md#download-for-steam-deck); the steps below are for source developers. The [package workflow](../.github/workflows/steam-deck.yml) builds only Linux x86-64 on a glibc 2.35 base. It checks the extracted installer and makes an installed-executable Vulkan test on Ubuntu 24.04 mandatory before tag releases. Pushes to `main`, pull requests and manual runs produce a `steam-deck-package` artifact; `v*` tags publish the checked ZIP and checksums as a GitHub Release. Artifacts expire after 14 days; release assets persist.
+
 Build in a Linux development environment rather than modifying SteamOS's read-only root. Use Clang (generated code requires `musttail`), CMake 3.20+, Ninja, Python 3, Vulkan 1.3 headers/loader, SDL3, glslang, zlib, LZ4 and zstd. The [Linux CI workflow](../.github/workflows/linux.yml) contains the Ubuntu dependency and SDL build recipe.
 
 CMake's `-DWWHD_BUNDLED_DEPS=ON` fetches pinned glslang/zlib/LZ4 and SDL3 if missing; it still needs the toolchain and Vulkan development installation. zstd uses a system package when available, otherwise pinned source. Set `CMAKE_PREFIX_PATH` for dependencies installed in a custom prefix and ensure their shared libraries are on the loader path.

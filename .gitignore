@@ -26,6 +26,7 @@ captures/
 *.key
 *.wud
 *.wux
+*.wua
 *.iso
 *.rvz
 template.bin
@@ -41,3 +42,4 @@ headstart.bin
 /wwhd_src/
 # local coordination board
 /task.md
+/dist/

@@ -4,7 +4,12 @@ The release packages contain no game files and no game code. The first start of 
 builds the game on the player's machine from their own dump (a disc image, a Cemu archive or an
 extracted game folder): it extracts the game (a disc image or archive only), translates its code to C, compiles it with a pinned compiler
 and links it with the prebuilt runtime. Later starts launch the built game directly. Player
-instructions are in the main README ("Install (releases)").
+instructions are in the main README ("Download for Steam Deck").
+
+This project's Actions produce a Steam Deck Linux x86-64 package only. The common installer
+retains inherited platform helpers for maintainability; they are not additional release targets.
+Deck manifests include initial `settings.ini` values for interpolated 60 FPS, 1x, FIFO and PiP.
+They are written only when no settings file exists; updates/repair preserve user choices.
 
 ## Portable releases
 
@@ -69,8 +74,8 @@ the vendored ImGui release.
 
 ## Linux on x86-64 and arm64
 
-There are two Linux releases, `linux-x86_64` and `linux-aarch64`, built by the same release job on
-an x86-64 and an arm64 runner. Each records its toolchain in `sdk/manifest.json`: `zig-0.16.0`
+Upstream supports `linux-x86_64` and `linux-aarch64`; this project's workflow packages x86-64 only.
+The inherited format records its toolchain in `sdk/manifest.json`: `zig-0.16.0`
 (x86-64 host, target `x86_64-linux-gnu.2.35`) or `zig-0.16.0-aarch64` (arm64 host, target
 `aarch64-linux-gnu.2.35`), both pinned with their SHA-256 in `toolchains.json`, so the game code a
 player compiles always matches the prebuilt runtime. `setup.py` refuses a release for the other

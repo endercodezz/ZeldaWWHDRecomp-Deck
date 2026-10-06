@@ -1526,6 +1526,7 @@ def install(ctx, source, keys=None, info=None, ui=None, check_keys=None):
             f.write("Portable mode: this game keeps its settings, controls, save states and shader caches in\n"
                     "../user (next to this folder) instead of your user folders. Delete this file to use those.\n")
         os.makedirs(os.path.join(data_dir, "user"), exist_ok=True)
+        seed_package_settings(manifest, data_dir)
         if args.shortcuts and kind != "gen":
             state["shortcut"] = create_shortcut()
     elif not args.no_shortcuts and kind != "gen":
@@ -1550,6 +1551,22 @@ def install(ctx, source, keys=None, info=None, ui=None, check_keys=None):
         os.makedirs(os.path.join(data_dir, "save"), exist_ok=True)
     write_state(data_dir, state)
     return state
+
+
+def seed_package_settings(manifest, data_dir):
+    """Release defaults apply only to a fresh portable configuration, never a repair/import."""
+    defaults = manifest.get("default_settings", {})
+    if not defaults:
+        return
+    path = os.path.join(data_dir, "user", "settings.ini")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        with open(path, "x", encoding="utf-8") as f:
+            f.write("# Initial package defaults; editable in the settings overlay.\n")
+            for key, value in defaults.items():
+                f.write("%s=%s\n" % (key, value))
+    except FileExistsError:
+        pass
 
 
 def main():

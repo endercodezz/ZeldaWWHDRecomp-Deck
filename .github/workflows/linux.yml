@@ -1,11 +1,14 @@
 # Linux build check: builds the Vulkan/SDL3 runtime against placeholder guest code
 # (tools/recomp/stubgen.py; no game files involved), runs the unit tests and the renderer
 # smoke test on Mesa's software Vulkan driver (lavapipe) with the Khronos validation layer.
-name: linux
+name: Linux runtime checks
 
 on:
   push:
   pull_request:
+
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -43,6 +46,7 @@ jobs:
         run: |
           python3 tools/recomp/stubgen.py build/gen-stub
           cmake -S . -B build/linux -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_BUILD_TYPE=Release -DWWHD_RENDERER=VULKAN \
             -DGEN_DIR="$PWD/build/gen-stub" -DCMAKE_PREFIX_PATH="$HOME/sdl3"
 
       - name: Build

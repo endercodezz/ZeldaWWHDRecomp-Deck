@@ -1,52 +1,37 @@
 #!/usr/bin/env python3
-"""Release notes from README.md: install instructions + the "What's new" section + checksums.
-
-usage: notes.py README.md VERSION SHA256SUMS.txt > notes.md
-"""
-import re
+"""Steam Deck release notes. Usage: notes.py README VERSION SHA256SUMS.txt."""
+from pathlib import Path
 import sys
 
 
-def section(text, title_prefix):
-    m = re.search(r"^## %s.*?$\n(.*?)(?=^## )" % re.escape(title_prefix), text, re.S | re.M)
-    return m.group(1).strip() if m else ""
-
-
 def main():
-    readme, version, sums = sys.argv[1:4]
-    with open(readme, encoding="utf-8") as f:
-        text = f.read()
-    new = section(text, "What's new")
-    with open(sums) as f:
-        checksums = f.read().strip()
-    print("""**The Wind Waker HD, native PC port, %s**
+    _, version, sums = sys.argv[1:4]
+    checksums = Path(sums).read_text().strip()
+    print(f"""# ZeldaWWHDRecomp-Deck {version}
 
-This release contains **no game files, no game code and no keys**. You need your own disc dump
-(.wux/.wud with its disc key, plus the Wii U common key from your console), a Cemu .wua archive
-(no keys needed), or an already extracted game folder. The installer builds the game from it on your machine.
+Steam Deck LCD/OLED package for SteamOS (Linux x86-64, glibc 2.35+, Vulkan 1.3).
+Based on ZeldaWWHDRecomp and its contributors; maintained by endercodezz.
 
-**Install:** download the zip for your system, unzip it anywhere and start **Wind Waker HD**. The
-first start prepares the game once from your dump (about two minutes); later starts launch it directly.
-Everything stays in that folder.
-- macOS (Apple Silicon, macOS 14+): `Wind Waker HD.app`. The release is not signed by Apple:
-  macOS 15+: System Settings > Privacy & Security > Open Anyway; macOS 14: right-click > Open
-- Windows (x86-64): `Wind Waker HD.exe` (SmartScreen: "More info" > "Run anyway")
-- Linux (glibc 2.35+, Vulkan): `wind-waker-hd`; `linux-x86_64` for x86-64, `linux-aarch64` for arm64
-  (Raspberry Pi 5, Asahi Linux, ARM laptops)
+1. Download `ZeldaWWHDRecomp-Deck-*-steamdeck-x86_64.zip` and extract the whole folder in Desktop Mode.
+2. Open `wind-waker-hd`, choose your own USA version-0 dump and let setup build the game locally.
+3. Press Play; add `wind-waker-hd` to Steam as a non-Steam game without forcing Proton.
 
-See "Install (releases)" in the README for details.
+Supported inputs: extracted `code/content/meta` folder, `.wua`, or `.wud`/`.wux` with your own keys.
+A raw RPX alone is insufficient. No game code, assets or keys are included in this download.
+Setup downloads its verified compiler; no system compiler installation is needed.
+Read `START-HERE.txt` inside the archive for controls, settings and updating.
 
-## What's new
+Fresh installs select interpolated 60 FPS, 1x rendering, FIFO and GamePad picture-in-picture.
+Interpolation keeps 30 Hz game logic. Stable 60 FPS and suspend/resume on Deck remain unverified.
+CI validates package installation using placeholder game code and software Vulkan, not gameplay.
 
-%s
-
-## Checksums (SHA-256)
+## SHA-256
 
 ```
-%s
+{checksums}
 ```
-""" % (version, new or "See the README.", checksums))
+""")
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
