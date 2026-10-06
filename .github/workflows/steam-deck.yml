@@ -167,7 +167,7 @@ jobs:
       - name: Install software Vulkan test environment
         run: |
           sudo apt-get update
-          sudo apt-get install -y mesa-vulkan-drivers vulkan-validationlayers xvfb
+          sudo apt-get install -y mesa-vulkan-drivers vulkan-validationlayers vulkan-tools xvfb
       - name: Verify archive and install from the downloadable package
         run: |
           (cd dist && sha256sum -c SHA256SUMS.txt)
@@ -182,9 +182,13 @@ jobs:
       - name: Installed renderer smoke test (lavapipe + validation, required)
         env:
           WWHD_VK_VALIDATION: '1'
-          VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
         run: |
           set -o pipefail
+          # Mesa packages use either lvp_icd.json or lvp_icd.x86_64.json.
+          export VK_DRIVER_FILES="$(find /usr/share/vulkan/icd.d -maxdepth 1 -name 'lvp_icd*.json' -print -quit)"
+          test -f "$VK_DRIVER_FILES"
+          cat "$VK_DRIVER_FILES"
+          xvfb-run -a vulkaninfo --summary
           xvfb-run -a -s '-screen 0 1280x800x24' "$RUNNER_TEMP/data/bin/wwhd" --renderer-smoke 2>&1 | tee smoke.log
           grep -q PASS smoke.log
           ! grep -q VUID smoke.log
