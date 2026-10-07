@@ -82,11 +82,20 @@ int main(){
  assert(graphicsKey=='7');input::release_keys();
  set_env("WWHD_NO_HOST_INPUT","1");graphicsEvent(SDL_SCANCODE_R,game);assert(graphicsRequests==7);set_env("WWHD_NO_HOST_INPUT",nullptr);
  // the text prompt: typed text goes to it, keys of every game window to overlay::key, none to the game
+ SDL_SetHint(SDL_HINT_ENABLE_SCREEN_KEYBOARD,"1");
  promptShown=true;input::update();
+#if defined(__linux__) && !defined(__ANDROID__)
+ assert(!SDL_GetHintBoolean(SDL_HINT_ENABLE_SCREEN_KEYBOARD,true));
+ assert(SDL_TextInputActive(game));
+#endif
  SDL_Event typed{};typed.type=SDL_EVENT_TEXT_INPUT;typed.text.text="Link";input::handle_event(typed);assert(promptText=="Link");
  key(SDL_SCANCODE_K,true);graphicsEvent(SDL_SCANCODE_RETURN,controls);assert(promptKeys==2);
  input::held_keys(held);assert(!held[input_map::key_from_id("K")]&&!(input::read().buttons&input::kA));
  promptShown=false;input::update();
+#if defined(__linux__) && !defined(__ANDROID__)
+ assert(SDL_GetHintBoolean(SDL_HINT_ENABLE_SCREEN_KEYBOARD,false));
+ assert(!SDL_TextInputActive(game));
+#endif
  // the key that confirmed is still held: its repeats don't press it in the game
  graphicsEvent(SDL_SCANCODE_RETURN,game,true);input::held_keys(held);assert(!held[input_map::key_from_id("Return")]);
  graphicsEvent(SDL_SCANCODE_RETURN,game,false,SDL_EVENT_KEY_UP);

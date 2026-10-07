@@ -126,6 +126,8 @@ struct Ui {
     float prev[input_map::kPadCount] = {};
     double options_since = -1;
     bool options_latched = false;
+    double sticks_since = -1;
+    bool sticks_latched = false;
     // remap capture: action, column (0, 1 keys; 2 controller)
     int cap_action = -1, cap_col = 0;
     bool cap_pad_released = false;
@@ -324,8 +326,21 @@ void read_controller() {
     input::host_controller_values(U.values);
     using namespace input_map;
     const double t = now_s();
-    // Home: toggles; Select / Minus (View / Share): held half a second opens, a press closes
-    if (controller_pressed(kPadHome)) set_open(!is_open());
+    // Guide belongs to Steam. Stick clicks reach the game in Game Mode without
+    // opening Steam's overlay; latch until release so a hold toggles only once.
+    if (controller_down(kPadL3) && controller_down(kPadR3)) {
+        if (!U.sticks_latched) {
+            if (U.sticks_since < 0) U.sticks_since = t;
+            if (t - U.sticks_since >= 0.5) {
+                set_open(!is_open());
+                U.sticks_latched = true;
+            }
+        }
+    } else {
+        U.sticks_since = -1;
+        U.sticks_latched = false;
+    }
+    // View / Select remains available on layouts that deliver it to SDL.
     if (controller_down(kPadOptions)) {
         if (!U.options_latched) {
             if (is_open()) {
@@ -500,9 +515,6 @@ void tab_graphics() {
     if (radio("30 fps (original)", m == 0)) post_changed([] { interp::set_mode(0); });
     ImGui::SameLine();
     if (radio("60 fps: frame interpolation", m == 1)) post_changed([] { interp::set_mode(1); });
-    ImGui::SameLine();
-    if (radio("True 60 (experimental)", m == 2)) post_changed([] { interp::set_mode(2); });
-    help("True 60 runs the game logic at 60 steps per second");
     if (m == 1) {
         bool paced;
         if (check("Keep game speed", interp::paced_interpolation(), &paced, !getenv("WWHD_INTERP_PACED")))
@@ -515,7 +527,7 @@ void tab_graphics() {
     static const float scales[] = {1.0f, 1.5f, 2.0f, 3.0f};
     static const char* const names[] = {"1x  (1280x720)", "1.5x  (1920x1080)", "2x  (2560x1440)", "3x  (3840x2160)"};
     float cur = hostui::res_scale();
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 2; i++) {
         if (i) ImGui::SameLine();
         float s = scales[i];
         if (radio(names[i], std::fabs(cur - s) < 0.01f)) post_changed([s] { hostui::set_res_scale(s); });
@@ -523,59 +535,75 @@ void tab_graphics() {
 
     heading("Aspect ratio");
     int am = aspect::mode();
-    for (int i = aspect::kOriginal; i <= aspect::k32x9; i++) {
+    for (int i = aspect::kOriginal; i <= aspect::k16x10; i++) {
         if (i) ImGui::SameLine();
         if (radio(aspect::mode_name(i), am == i)) post_changed([i] { aspect::set_mode(i); });
     }
 
-    heading("Effects");
     bool v;
-    const bool ao_ok = render::feature_available(render::kFeatureAO);
-    static const char* const ao[] = {"AO: original", "AO: centre fix", "AO: centre + noise fix"};
-    for (int i = 0; i < 3; i++) {
-        if (i) ImGui::SameLine();
-        if (radio(ao[i], render::ao_mode() == i, ao_ok)) post_changed([i] { render::set_ao_mode(i); });
-    }
-    if (check("Full-size occlusion depth", render::ao_hires(), &v, render::feature_available(render::kFeatureAOHires)))
-        post_changed([v] { render::set_ao_hires(v); });
-    ImGui::SameLine(0, 30);
-    if (check("16x anisotropic filtering", render::aniso(), &v, render::feature_available(render::kFeatureAniso)))
-        post_changed([v] { render::set_aniso(v); });
-    ImGui::SameLine(0, 30);
-    if (check("Edge smoothing (FXAA)", render::fxaa(), &v, render::feature_available(render::kFeatureFXAA)))
-        post_changed([v] { render::set_fxaa(v); });
-    heading("Presentation (Vulkan)");
-#ifdef WWHD_HAS_VULKAN
-    {
-        const bool vk = render::vulkan(), env = gfxvk::present_mode_from_env();
-        static const char* const names[] = {"Vsync (smooth)", "Low latency", "Off (may tear)"};
-        static const char* const tips[] = {"FIFO: every frame waits for the display's refresh; no tearing (default)",
-                                           "MAILBOX: the newest finished frame is shown at the next refresh; no tearing, less delay",
-                                           "IMMEDIATE: frames are shown at once; lowest delay, may tear"};
-        // the mode in use: the setting, or vsync when this driver does not offer it
-        const int in_use = gfxvk::present_mode_offered(gfxvk::present_mode()) ? gfxvk::present_mode() : gfxvk::kPresentFifo;
-        for (int i = 0; i < gfxvk::kPresentModes; i++) {
+    if (ImGui::CollapsingHeader("Advanced graphics")) {
+        heading("Higher internal resolution");
+        for (int i = 2; i < 4; i++) {
+            if (i > 2) ImGui::SameLine();
+            float s = scales[i];
+            if (radio(names[i], std::fabs(cur - s) < 0.01f)) post_changed([s] { hostui::set_res_scale(s); });
+        }
+        heading("Ultrawide aspect ratio");
+        for (int i = aspect::k21x9; i <= aspect::k32x9; i++) {
+            if (i > aspect::k21x9) ImGui::SameLine();
+            if (radio(aspect::mode_name(i), am == i)) post_changed([i] { aspect::set_mode(i); });
+        }
+        heading("Experimental frame rate");
+        if (radio("True 60 (experimental)", m == 2)) post_changed([] { interp::set_mode(2); });
+        help("True 60 runs the game logic at 60 steps per second");
+        heading("Effects");
+        const bool ao_ok = render::feature_available(render::kFeatureAO);
+        static const char* const ao[] = {"AO: original", "AO: centre fix", "AO: centre + noise fix"};
+        for (int i = 0; i < 3; i++) {
             if (i) ImGui::SameLine();
-            const bool offered = gfxvk::present_mode_offered(i);
-            if (radio(names[i], in_use == i, vk && !env && offered)) post_changed([i] { gfxvk::set_present_mode(i); });
-            if (vk && !offered) help("not offered by this driver");
-            else help(tips[i]);
+            if (radio(ao[i], render::ao_mode() == i, ao_ok)) post_changed([i] { render::set_ao_mode(i); });
         }
-        if (!vk) note("Used by the Vulkan renderer only (Metal always presents with vsync).");
-        else if (env) note("WWHD_VK_PRESENT_MODE=%s is set for this start and takes precedence.", getenv("WWHD_VK_PRESENT_MODE"));
-        else {
-            std::string missing;
-            for (int i = 1; i < gfxvk::kPresentModes; i++)
-                if (!gfxvk::present_mode_offered(i)) missing += std::string(missing.empty() ? "" : ", ") + names[i];
-            if (!missing.empty()) note("Not offered by this driver: %s.", missing.c_str());
+        if (check("Full-size occlusion depth", render::ao_hires(), &v, render::feature_available(render::kFeatureAOHires)))
+            post_changed([v] { render::set_ao_hires(v); });
+        ImGui::SameLine(0, 30);
+        if (check("16x anisotropic filtering", render::aniso(), &v, render::feature_available(render::kFeatureAniso)))
+            post_changed([v] { render::set_aniso(v); });
+        ImGui::SameLine(0, 30);
+        if (check("Edge smoothing (FXAA)", render::fxaa(), &v, render::feature_available(render::kFeatureFXAA)))
+            post_changed([v] { render::set_fxaa(v); });
+        heading("Presentation (Vulkan)");
+#ifdef WWHD_HAS_VULKAN
+        {
+            const bool vk = render::vulkan(), env = gfxvk::present_mode_from_env();
+            static const char* const names[] = {"Vsync (smooth)", "Low latency", "Off (may tear)"};
+            static const char* const tips[] = {"FIFO: every frame waits for the display's refresh; no tearing (default)",
+                                               "MAILBOX: the newest finished frame is shown at the next refresh; no tearing, less delay",
+                                               "IMMEDIATE: frames are shown at once; lowest delay, may tear"};
+            // the mode in use: the setting, or vsync when this driver does not offer it
+            const int in_use = gfxvk::present_mode_offered(gfxvk::present_mode()) ? gfxvk::present_mode() : gfxvk::kPresentFifo;
+            for (int i = 0; i < gfxvk::kPresentModes; i++) {
+                if (i) ImGui::SameLine();
+                const bool offered = gfxvk::present_mode_offered(i);
+                if (radio(names[i], in_use == i, vk && !env && offered)) post_changed([i] { gfxvk::set_present_mode(i); });
+                if (vk && !offered) help("not offered by this driver");
+                else help(tips[i]);
+            }
+            if (!vk) note("Used by the Vulkan renderer only (Metal always presents with vsync).");
+            else if (env) note("WWHD_VK_PRESENT_MODE=%s is set for this start and takes precedence.", getenv("WWHD_VK_PRESENT_MODE"));
+            else {
+                std::string missing;
+                for (int i = 1; i < gfxvk::kPresentModes; i++)
+                    if (!gfxvk::present_mode_offered(i)) missing += std::string(missing.empty() ? "" : ", ") + names[i];
+                if (!missing.empty()) note("Not offered by this driver: %s.", missing.c_str());
+            }
         }
-    }
 #else
-    ImGui::BeginDisabled();
-    radio("Vsync (smooth)", true);
-    ImGui::EndDisabled();
-    note("This build has no Vulkan renderer.");
+        ImGui::BeginDisabled();
+        radio("Vsync (smooth)", true);
+        ImGui::EndDisabled();
+        note("This build has no Vulkan renderer.");
 #endif
+    }
     heading("Overlay");
     if (check("Performance overlay (FPS, frame time)", perf_shown(), &v)) set_perf_shown(v);
 }
@@ -947,10 +975,9 @@ void tab_about() {
     ImGui::Text("The Legend of Zelda: The Wind Waker HD - native port (%s host, %s renderer)", hostui::name(),
                 render::api_name(render::active()));
 #ifdef __APPLE__
-    note("Settings overlay: F1 (Fn+F1 on most Mac keyboards), Cmd+, or Settings... in the app menu, or hold Select / "
-         "press Home on a controller. Esc, F1 or B closes. "
+    note("Settings overlay: F1 (Fn+F1 on most Mac keyboards), Cmd+, or Settings... in the app menu, or hold L3 + R3 / Select. Esc, F1 or B closes. "
 #else
-    note("Settings overlay: F1, or hold Select / press Home on a controller. Esc, F1 or B closes. "
+    note("Settings: hold L3 + R3 for half a second, F1, or hold View / Select. Esc, F1 or B closes. "
 #endif
          "L / R switch tabs on a controller. The game keeps running and sees no input while this menu is open.");
     note("When the game asks for text (your name), a text window appears over the game: type on the keyboard "
@@ -976,10 +1003,10 @@ void perf_window(bool menu_open) {
     ImGuiWindowFlags fl = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
                           ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs;
     if (ImGui::Begin("##perf", nullptr, fl)) {
-        ImGui::Text("%.0f fps   %.1f ms (worst %.1f)", U.fps, sum / 120.0f, worst);
+        ImGui::Text("%.0f fps   %.1f ms   worst %.1f ms", U.fps, sum / 120.0f, worst);
         ImGui::PlotLines("##ft", U.frame_ms, 120, U.frame_i, nullptr, 0.0f, 50.0f, ImVec2(220, 36));
         ImGui::TextDisabled("%s  %gx  %s", render::api_name(render::active()), hostui::res_scale(),
-                            interp::mode() == 2 ? "true 60" : interp::mode() == 1 ? "60 fps" : "30 fps");
+                            interp::mode() == 2 ? "experimental true 60" : interp::mode() == 1 ? "interpolation ON (target 60)" : "native 30 (interpolation OFF)");
         if (float share = interp::paced_drawn_share(); share >= 0)
             ImGui::TextDisabled("60 fps frames drawn: %.0f%%", share * 100.0f);
     }

@@ -394,8 +394,22 @@ void update(){
  // SDL text input in every game window while the overlay's text prompt shows (typed text, input methods;
  // on Android it brings up the system keyboard); the input method's candidates open over the prompt
  static bool entry_text=false;
+#if defined(__linux__) && !defined(__ANDROID__)
+ static std::string screen_keyboard_hint;
+ static bool had_screen_keyboard_hint=false;
+#endif
  if(text_entry::active()!=entry_text&&!g_done){
   entry_text=!entry_text;int n=0;
+#if defined(__linux__) && !defined(__ANDROID__)
+  // Our controller keyboard already owns the prompt. Starting SDL text input
+  // must still accept physical-keyboard/IME text without opening Steam's OSK.
+  if(entry_text){
+   const char* previous=SDL_GetHint(SDL_HINT_ENABLE_SCREEN_KEYBOARD);
+   had_screen_keyboard_hint=previous!=nullptr;
+   screen_keyboard_hint=previous?previous:"";
+   SDL_SetHint(SDL_HINT_ENABLE_SCREEN_KEYBOARD,"0");
+  }
+#endif
   if(SDL_Window** ws=SDL_GetWindows(&n)){
    for(int i=0;i<n;i++){
     if(!entry_text){SDL_StopTextInput(ws[i]);continue;}
@@ -404,6 +418,12 @@ void update(){
    }
    SDL_free(ws);
   }
+#if defined(__linux__) && !defined(__ANDROID__)
+  if(!entry_text){
+   if(had_screen_keyboard_hint)SDL_SetHint(SDL_HINT_ENABLE_SCREEN_KEYBOARD,screen_keyboard_hint.c_str());
+   else SDL_ResetHint(SDL_HINT_ENABLE_SCREEN_KEYBOARD);
+  }
+#endif
  }
  post_test_keys();
  float v[input_map::kPadCount]={};using namespace input_map;
