@@ -4,6 +4,8 @@
 #include "mouse_sdl.h"
 #include "../input.h"
 #include "../input_map.h"
+#include "../motion/motion.h"
+#include "../rumble.h"
 #include "../runtime.h"
 #include "../savestate.h"
 #include "../gfx/vulkan/settings.h"
@@ -11,6 +13,7 @@
 #include "../overlay/overlay.h"
 #include "../overlay/text_entry.h"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstring>
@@ -18,6 +21,7 @@
 #include <map>
 #include <mutex>
 #include <set>
+#include <thread>
 #include <utility>
 #include <vector>
 namespace render { uint64_t frame_count(); }
@@ -191,42 +195,99 @@ static bool overlay_event(const SDL_Event& event){
 }
 static PadState keyboard_state(bool host){bool keys[256];for(int i=0;i<256;i++)keys[i]=(host&&g_keys[i])||g_script_keys[i];return input_map::keyboard_state(input_map::current(),keys);}
 // ---- rumble -----------------------------------------------------------------------------------
-// The game drives the motor from a guest thread (VPADControlMotor / WPADControlMotor in
-// runtime/src/hle), so a request only lands here and update() does the work on the main thread,
-// with the rest of the input.
-static std::mutex g_rumble_mu;
-static bool g_rumble_pending;
-static float g_rumble_strength;
-static Uint32 g_rumble_ms;
-void set_rumble(float strength,uint32_t duration_ms){
- std::lock_guard lk(g_rumble_mu);
- g_rumble_strength=std::clamp(strength,0.f,1.f);g_rumble_ms=duration_ms;g_rumble_pending=true;
-}
-static void apply_rumble(){
- // debug: WWHD_RUMBLE=0 turns the motor off, WWHD_RUMBLE_LOG=1 logs the requests
- static const bool off=getenv("WWHD_RUMBLE")&&!atoi(getenv("WWHD_RUMBLE"));
- static const bool log_requests=getenv("WWHD_RUMBLE_LOG")!=nullptr;
- float strength;Uint32 ms;
- {std::lock_guard lk(g_rumble_mu);
-  if(!g_rumble_pending)return;
-  g_rumble_pending=false;strength=g_rumble_strength;ms=g_rumble_ms;}
- if(off)return;
- // no controller, or none with a motor: nothing to do, and nothing to say
- if(g_rumble_controllers.empty())return;
- // SDL wants a duration even for the request that stops the motor (intensity 0)
- if(ms==0)ms=1;
- auto level=(Uint16)(strength*0xFFFFu);
+// The game's requests (VPADControlMotor / WPADControlMotor in runtime/src/hle) are kept by
+// rumble.h; update() sets the motors from them on the main thread, with the rest of the input. A
+// running motor is sent again every update with a short duration, so it never outlasts the
+// requests by more than kRumbleRefreshMs; should the main loop stall (SDL ends a rumble only while
+// it pumps events), a watchdog thread stops the motors after kRumbleStallMs.
+// The motors are still while the option is off, the settings overlay is open (the game sees no
+// input then), no game window has the keyboard (SDL reads no controllers in the background), and
+// from the moment the process ends (quit, exit, crash): it ends without SDL_Quit, and XInput and
+// HIDAPI controllers keep the last motor level they were sent after it.
+constexpr Uint32 kRumbleRefreshMs=150,kRumbleStallMs=300;
+static std::mutex g_pads_mu;  // g_controllers, g_rumble_*: the watchdog and exit paths run on other threads
+static std::map<SDL_JoystickID,Uint16> g_rumble_sent;  // the level each controller runs at
+static std::atomic<bool> g_rumble_quit{false};
+static std::atomic<Uint64> g_rumble_update_ms{0};  // SDL_GetTicks of the latest update
+static void rumble_all_locked(Uint16 level,Uint32 ms){
  for(auto id:g_rumble_controllers){
   auto i=g_controllers.find(id);
-  if(i!=g_controllers.end()&&SDL_GamepadConnected(i->second))SDL_RumbleGamepad(i->second,level,level,ms);
+  if(i==g_controllers.end()||!SDL_GamepadConnected(i->second))continue;
+  Uint16& sent=g_rumble_sent[id];
+  if(level||sent)SDL_RumbleGamepad(i->second,level,level,level?ms:0);
+  if(rumble::log_enabled()&&level!=sent)LOG("[rumble] host: controller %u motor %.2f",(unsigned)id,level/65535.0);
+  sent=level;
  }
- if(log_requests)LOG("[rumble] strength %.2f for %u ms on %zu controller(s)",strength,(unsigned)ms,g_rumble_controllers.size());
+}
+static void apply_rumble(){
+ g_rumble_update_ms=SDL_GetTicks();
+ if(g_rumble_controllers.empty()||g_rumble_quit)return;  // no controller with a motor: nothing to do
+ // the share of "on" over the next host frame (the motor spins up and down slower than that)
+ float level=rumble::host_level(1000000/60);
+ if(overlay::is_open()||!SDL_GetKeyboardFocus())level=0;  // the game cannot stop it from here
+ std::lock_guard lk(g_pads_mu);
+ rumble_all_locked((Uint16)(std::clamp(level,0.f,1.f)*0xFFFFu),kRumbleRefreshMs);
+}
+static void rumble_watchdog(){
+ while(!g_rumble_quit){
+  SDL_Delay(100);
+  if(SDL_GetTicks()-g_rumble_update_ms<kRumbleStallMs)continue;
+  std::lock_guard lk(g_pads_mu);
+  if(std::any_of(g_rumble_sent.begin(),g_rumble_sent.end(),[](auto& s){return s.second!=0;})){
+   LOG("[rumble] the main loop stalls: motors stopped");
+   rumble_all_locked(0,0);  // the next update runs them again
+  }
+ }
+}
+void stop_rumble_now(){
+ g_rumble_quit=true;
+ // crash handler: never wait for a thread that may be gone
+ std::unique_lock lk(g_pads_mu,std::try_to_lock);
+ if(lk.owns_lock())rumble_all_locked(0,0);
+}
+// SDL_EVENT_QUIT and closing the TV window end the process at once (std::_Exit in the renderer's
+// loop): an event watch sees them as they arrive, before the loop does
+static bool rumble_quit_watch(void*,SDL_Event* event){
+ if(event->type==SDL_EVENT_QUIT||event->type==SDL_EVENT_TERMINATING||
+    (event->type==SDL_EVENT_WINDOW_CLOSE_REQUESTED&&g_prompt_window&&event->window.windowID==SDL_GetWindowID(g_prompt_window)))
+  stop_rumble_now();
+ return true;
+}
+bool has_rumble(){return true;}
+// ---- motion sensors (motion/motion.h) ------------------------------------------------------------
+// Controllers with a gyro and an accelerometer (DualSense, DualShock 4, Switch Pro, Joy-Con, Steam Deck,
+// ...) send both through SDL; the sensors run only while the gyro source is "controller" (they cost
+// battery and bandwidth). A gyro sample goes to motion.h with the latest accelerometer sample.
+static bool g_sensors_on=false;
+static std::map<SDL_JoystickID,std::array<float,3>> g_accel;
+static bool has_motion(SDL_Gamepad* pad){return SDL_GamepadHasSensor(pad,SDL_SENSOR_GYRO)&&SDL_GamepadHasSensor(pad,SDL_SENSOR_ACCEL);}
+static void set_sensors_locked(SDL_Gamepad* pad,bool on){
+ if(!has_motion(pad))return;
+ SDL_SetGamepadSensorEnabled(pad,SDL_SENSOR_GYRO,on);SDL_SetGamepadSensorEnabled(pad,SDL_SENSOR_ACCEL,on);
+}
+static void update_sensors(){
+ const bool want=motion::wants_controller_sensors();
+ std::lock_guard lk(g_pads_mu);
+ int n=0;for(auto [id,pad]:g_controllers)if(SDL_GamepadConnected(pad)&&has_motion(pad))n++;
+ motion::set_gyro_controllers(n);
+ if(want==g_sensors_on)return;
+ g_sensors_on=want;g_accel.clear();
+ for(auto [id,pad]:g_controllers)set_sensors_locked(pad,want);
+ if(want)LOG("[gyro] controller motion sensors on (%d controller(s) with a gyro)",n);
+}
+static void sensor_event(const SDL_GamepadSensorEvent& e){
+ if(e.sensor==SDL_SENSOR_ACCEL){g_accel[e.which]={e.data[0],e.data[1],e.data[2]};return;}
+ if(e.sensor!=SDL_SENSOR_GYRO)return;
+ auto a=g_accel.find(e.which);if(a==g_accel.end())return;
+ motion::controller_sample((uint64_t)e.which,e.sensor_timestamp,e.data,a->second.data());
 }
 static void open_controller(SDL_JoystickID id){
+ std::lock_guard lk(g_pads_mu);
  if(g_controllers.contains(id))return;
  if(auto* pad=SDL_OpenGamepad(id)){g_controllers[id]=pad;
   // asking for a rumble of zero intensity also tells us whether the controller has a motor
-  if(SDL_RumbleGamepad(pad,0,0,0))g_rumble_controllers.insert(id);}
+  if(SDL_RumbleGamepad(pad,0,0,0))g_rumble_controllers.insert(id);
+  if(g_sensors_on)set_sensors_locked(pad,true);}
 }
 void init(){
  input_map::load_startup();
@@ -234,6 +295,9 @@ void init(){
  if(!getenv("WWHD_NO_CONTROLLERS")) {
   if(!SDL_InitSubSystem(SDL_INIT_GAMEPAD)){LOG("[input] SDL gamepad initialization: %s",SDL_GetError());return;}
   int count=0;auto* ids=SDL_GetGamepads(&count);for(int i=0;i<count;i++)open_controller(ids[i]);SDL_free(ids);
+  SDL_AddEventWatch(rumble_quit_watch,nullptr);
+  atexit(stop_rumble_now);  // std::exit: the game's exit(), its main thread returned
+  std::thread(rumble_watchdog).detach();
  }
 }
 static std::string utf8(const std::u16string& text){
@@ -331,7 +395,8 @@ void handle_event(const SDL_Event& event){
  if(overlay::captures())mods::update_mouse();
  else if(mods::handle_mouse_event(event))return;
  if(event.type==SDL_EVENT_GAMEPAD_ADDED&&!getenv("WWHD_NO_CONTROLLERS"))open_controller(event.gdevice.which);
- if(event.type==SDL_EVENT_GAMEPAD_REMOVED){auto i=g_controllers.find(event.gdevice.which);if(i!=g_controllers.end()){SDL_CloseGamepad(i->second);g_controllers.erase(i);}g_rumble_controllers.erase(event.gdevice.which);}
+ if(event.type==SDL_EVENT_GAMEPAD_REMOVED){std::lock_guard lk(g_pads_mu);auto i=g_controllers.find(event.gdevice.which);if(i!=g_controllers.end()){SDL_CloseGamepad(i->second);g_controllers.erase(i);}g_rumble_controllers.erase(event.gdevice.which);g_rumble_sent.erase(event.gdevice.which);g_accel.erase(event.gdevice.which);motion::controller_gone(event.gdevice.which);}
+ if(event.type==SDL_EVENT_GAMEPAD_SENSOR_UPDATE){if(!getenv("WWHD_NO_HOST_INPUT")&&!overlay::blocks_input())sensor_event(event.gsensor);return;}
  if(event.type==SDL_EVENT_WINDOW_FOCUS_LOST)release_keys();
  if(text_entry_event(event))return;
  if(g_done){
@@ -388,6 +453,7 @@ void handle_event(const SDL_Event& event){
 void update(){
  mods::update_mouse();
  apply_rumble();
+ update_sensors();
  std::function<void(bool,std::u16string)> cancelled;
  {std::lock_guard lk(g_mu);if(g_pending&&!g_done){g_done=std::exchange(g_pending,nullptr);g_text=std::move(g_initial);g_max_len=g_pending_max_len;memset(g_keys,0,sizeof g_keys);if(!g_prompt_window)g_prompt_window=SDL_GetKeyboardFocus();if(g_prompt_window){g_previous_title=SDL_GetWindowTitle(g_prompt_window);if(SDL_StartTextInput(g_prompt_window)){other_windows_text_input(true);show_prompt();LOG("[input] the game asks for text: type it in a game window (shown in the window title), Enter confirms, Escape cancels; WWHD_SWKBD_TEXT=<text> answers automatically");}else{LOG("[input] text input unavailable (%s); set WWHD_SWKBD_TEXT=<text>",SDL_GetError());cancelled=std::exchange(g_done,nullptr);}}else{LOG("[input] text input: no window to type in; set WWHD_SWKBD_TEXT=<text>");cancelled=std::exchange(g_done,nullptr);}}}
  if(cancelled)cancelled(false,{});
@@ -441,6 +507,7 @@ void update(){
   stick(SDL_GAMEPAD_AXIS_LEFTX,SDL_GAMEPAD_AXIS_LEFTY,kPadLSUp,kPadLSDown,kPadLSLeft,kPadLSRight);stick(SDL_GAMEPAD_AXIS_RIGHTX,SDL_GAMEPAD_AXIS_RIGHTY,kPadRSUp,kPadRSDown,kPadRSLeft,kPadRSRight);
  }
  auto state=input_map::controller_state(input_map::current(),v);std::lock_guard lk(g_mu);std::copy(std::begin(v),std::end(v),g_values);g_pad=state;
+ if(!overlay::blocks_input()&&!getenv("WWHD_NO_HOST_INPUT"))motion::poll_recenter(v,g_keys);
 }
 void prompt_text(const std::u16string& initial,int max_len,std::function<void(bool,std::u16string)> done){std::lock_guard lk(g_mu);g_initial=initial;g_pending_max_len=std::max(0,max_len);if(g_initial.size()>(size_t)g_pending_max_len)g_initial.resize(g_pending_max_len);g_pending=std::move(done);}
 // debug: WWHD_PRESS=1000-1010:8000,1500-1505:0008 holds VPAD buttons (hex) during TV frame ranges

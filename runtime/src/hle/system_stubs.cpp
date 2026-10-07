@@ -3,6 +3,8 @@
 #include "../crashrec.h"
 #include "../runtime.h"
 #include "../input.h"
+#include "../rumble.h"
+#include "../motion/motion.h"
 
 namespace interp { bool repeat_input(); bool fresh_sticks(); void trace_read(const char*); uint64_t logic_steps(); }
 
@@ -130,8 +132,18 @@ HLE(vpad, VPADRead) {
     }
     stf32(st + 0x0C, p.lx); stf32(st + 0x10, p.ly);
     stf32(st + 0x14, p.rx); stf32(st + 0x18, p.ry);
-    stf32(st + 0x30, 1.0f);                                    // accXY
-    for (int i = 0; i < 3; i++) stf32(st + 0x6C + i * 0x10, 1.0f);  // dir = identity
+    {  // motion sensors (motion/motion.h). WWHD reads only the direction matrix (0x6C..0x8F): its
+       // first-person camera turns by the change from one frame to the next (dCamera_c::CalcSubjectAngle)
+        const motion::VpadMotion m = motion::vpad(repeat);
+        auto vec = [&](uint32_t at, const motion::Vec3& v) { stf32(at, v.x); stf32(at + 4, v.y); stf32(at + 8, v.z); };
+        vec(st + 0x1C, m.acc);
+        stf32(st + 0x28, m.acc_magnitude);
+        stf32(st + 0x2C, m.acc_variation);
+        stf32(st + 0x30, m.acc_xy[0]); stf32(st + 0x34, m.acc_xy[1]);
+        vec(st + 0x38, m.gyro);
+        vec(st + 0x44, m.angle);
+        for (int i = 0; i < 3; i++) vec(st + 0x6C + i * 0xC, m.dir[i]);
+    }
     // touch panel, raw coordinates as the hardware reports them (mapping from Cemu)
     static uint16_t last_tx = 0, last_ty = 0;
     if (p.touch) {
@@ -162,28 +174,19 @@ HLE(vpad, VPADGetTPCalibratedPointEx) {
     int res = (int)arg(c, 1);  // 0 = 1920x1080, 1 = 1280x720, 2 = 854x480
     tp_to_screen(arg(c, 2), arg(c, 3), res == 0 ? 1920 : res == 2 ? 854 : 1280, res == 0 ? 1080 : res == 2 ? 480 : 720);
 }
-// The GamePad motor: the game sends a pattern of bytes (0 = still, 0xFF = full strength) that
-// repeats while it wants rumble, and an empty pattern (or VPADStopMotor) stops it. A host
-// controller has one motor with one strength for a while, so the pattern becomes its root mean
-// square (a motor at full strength for a tenth of the time is felt, not ignored) for a fixed
-// while; the game asks again while the effect lasts, which restarts it.
-constexpr uint32_t kRumblePatternMax = 64;    // longer patterns than the hardware's own, to be safe
-constexpr uint32_t kRumbleMs = 500;           // how long one request runs the motor
+// The GamePad motor: the game sends a pattern of up to 120 bits (not bytes), played at 120 bits a
+// second; it stops by itself at the end, and an empty pattern or VPADStopMotor stops it at once.
+// rumble.h turns that into what the host controllers' motors do.
 HLE(vpad, VPADControlMotor) {
-    // (chan, uint8* pattern, uint8 length) -> int32 error
-    uint32_t chan = arg(c, 0), pattern = arg(c, 1), len = arg(c, 2) & 0xFF;
-    uint32_t steps = std::min(len, kRumblePatternMax);
-    float energy = 0;
-    for (uint32_t i = 0; i < steps; i++) {
-        float v = pattern ? ld8(pattern + i) / 255.f : 0.f;
-        energy += v * v;
-    }
-    float strength = steps ? std::sqrt(energy / steps) : 0.f;
-    TRACE("[pad] VPADControlMotor(%u, %u bytes) -> strength %.2f for %u ms", chan, len, strength, kRumbleMs);
-    input::set_rumble(strength, kRumbleMs);
+    // (chan, uint8* pattern, uint8 length in bits) -> int32 error
+    uint32_t chan = arg(c, 0), pattern = arg(c, 1), nbits = std::min<uint32_t>(arg(c, 2) & 0xFF, rumble::Motor::kMaxBits);
+    uint8_t bits[rumble::Motor::kMaxBits / 8] = {};
+    for (uint32_t i = 0; pattern && i < (nbits + 7) / 8; i++) bits[i] = ld8(pattern + i);
+    TRACE("[pad] VPADControlMotor(%u, %u bits)", chan, nbits);
+    rumble::gamepad_pattern(chan, pattern ? bits : nullptr, nbits);
     ret(c, 0);
 }
-HLE(vpad, VPADStopMotor) { input::set_rumble(0, 0); }
+HLE(vpad, VPADStopMotor) { rumble::gamepad_stop(arg(c, 0)); }
 HLE(vpadbase, VPADBASEGetHeadphoneStatus) { ret(c, 0); }
 
 // ---- padscore (Wii Remote / Pro Controller): see padscore.cpp

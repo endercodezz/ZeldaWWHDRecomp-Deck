@@ -289,7 +289,7 @@ uint32_t memory_type(uint32_t bits, VkMemoryPropertyFlags flags) {
   throw std::runtime_error("No compatible Vulkan memory type");
 }
 Buffer create_buffer(VkDeviceSize size, VkBufferUsageFlags usage,
-                     VkMemoryPropertyFlags flags) {
+                     VkMemoryPropertyFlags flags, VkMemoryPropertyFlags preferred) {
   Buffer b;
   b.size = std::max<VkDeviceSize>(size, 16);
   VkBufferCreateInfo ci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -302,6 +302,16 @@ Buffer create_buffer(VkDeviceSize size, VkBufferUsageFlags usage,
   VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
   ai.allocationSize = req.size;
   ai.memoryTypeIndex = memory_type(req.memoryTypeBits, flags);
+  if (preferred) {
+    VkPhysicalDeviceMemoryProperties p;
+    vkGetPhysicalDeviceMemoryProperties(R.physicalDevice, &p);
+    for (uint32_t i = 0; i < p.memoryTypeCount; i++)
+      if ((req.memoryTypeBits & (1u << i)) &&
+          (p.memoryTypes[i].propertyFlags & (flags | preferred)) == (flags | preferred)) {
+        ai.memoryTypeIndex = i;
+        break;
+      }
+  }
   vk_check(vkAllocateMemory(R.device, &ai, nullptr, &b.memory),
            "allocate buffer memory");
   vk_check(vkBindBufferMemory(R.device, b.buffer, b.memory, 0),
@@ -311,6 +321,20 @@ Buffer create_buffer(VkDeviceSize size, VkBufferUsageFlags usage,
              "map buffer");
   return b;
 }
+// GPU -> CPU copies (captures, overlay signatures): the CPU reads these, so host-cached memory where
+// the device has it (uncached reads of the plain host-visible type are very slow on discrete GPUs).
+Buffer create_readback_buffer(VkDeviceSize size) {
+  return create_buffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                       VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+}
+// The per-submission upload arena (and the buffer cache's blocks, buffer_cache.cpp) is written by the
+// CPU and read by the GPU only. The memory is host-visible but usually not host-cached: uncached or
+// write-combined system memory, or device-local BAR memory on discrete GPUs, where CPU reads are about
+// 100 times slower than cached ones. Rule: the CPU never reads mapped upload memory. Reuse checks and
+// index scans use CPU copies kept beside the slices (vertex_snapshot_history.h, uniform_snapshot.h,
+// draw.cpp's index paths, the buffer cache's index shadows); see docs/vulkan.md. The one exception is
+// the buffer cache's opt-in verify mode (WWHD_VK_BUFFER_CACHE_VERIFY=1, a diagnostic).
 UploadSlice allocate_upload(VkDeviceSize size, VkDeviceSize alignment) {
   size = std::max<VkDeviceSize>(size,16);
   alignment = std::max<VkDeviceSize>(alignment,4);
@@ -959,20 +983,16 @@ static bool SDLCALL lifecycle_watch(void *, SDL_Event *event) {
   return true;
 }
 #endif
-// Asynchronous presentation (WWHD_VK_ASYNC_PRESENT=1, the default on Android): the presentation
-// submission goes into the four-slot ring like GX2Flush work instead of waiting for the GPU, and the
-// SDL host's swap() does not drain the queue, so the render thread records frame N+1 while the GPU
-// draws frame N. Each frame in flight has its own acquire semaphore (reused only after the submission
-// that waited on it retired) and each swapchain image its own render-finished semaphore. Captures
-// keep the waiting path.
+// Asynchronous presentation (the default on every platform since 2026-10-07; WWHD_VK_ASYNC_PRESENT=0
+// restores the waiting path): the presentation submission goes into the four-slot ring like GX2Flush
+// work instead of waiting for the GPU, and swap() does not drain the queue, so the render thread
+// records frame N+1 while the GPU draws frame N. Each frame in flight has its own acquire semaphore
+// (reused only after the submission that waited on it retired) and each swapchain image its own
+// render-finished semaphore. Captures and frame dumps keep the waiting path.
 static bool async_present() {
   static const bool on = [] {
     const char *e = std::getenv("WWHD_VK_ASYNC_PRESENT");
-#ifdef __ANDROID__
     return !e || std::atoi(e) != 0;
-#else
-    return e && std::atoi(e) != 0;
-#endif
   }();
   return on;
 }
@@ -1276,16 +1296,14 @@ void swap() {
   present(R.tv);
   if (plan.drc_window)
     present(R.drc);
-#ifdef WWHD_SDL_HOST
   // asynchronous presentation: queued like GX2Flush work, the ring's fences retire it (the automatic
-  // overlay's signatures are read back right away, so those frames wait)
+  // overlay's signatures are read back right away, so those frames wait; present dumps and captures
+  // read back through flush()). Both window hosts: the AppKit host presents to its CAMetalLayers
+  // through the same swapchain path.
   if (async_present() && !sampled[0])
     flush_async();
   else
     flush();
-#else
-  flush();
-#endif
   if (sampled[0]) {
     std::vector<float> d = read_signature(0), t = sampled[1] ? read_signature(1) : std::vector<float>{};
     gfx::display_auto_signature(d, sampled[1] ? &t : nullptr, R.frame + 1);
@@ -2030,26 +2048,43 @@ static bool drc_key(const SDL_Event& event) {
   ::hostui::toggle_drc();
   return true;
 }
+// debug: a test variable's list of TV frames ("3500,3700"); due once per listed frame
+static bool test_frame_due(const std::vector<uint64_t> &frames, size_t &i) {
+  if (i >= frames.size() || frame_count() < frames[i]) return false;
+  i++;
+  return true;
+}
+static std::vector<uint64_t> test_frames(const char *var) {
+  std::vector<uint64_t> f;
+  if (const char *e = getenv(var))
+    for (const char *p = e; *p;) {
+      f.push_back(strtoull(p, (char **)&p, 10));
+      while (*p == ',') p++;
+    }
+  return f;
+}
 // debug: WWHD_TEST_DRC_KEY=3500,3700 simulates Ctrl+G at those frames (as display.mm's Cmd+G)
 static void test_drc_key() {
-  static const std::vector<uint64_t> frames = [] {
-    std::vector<uint64_t> f;
-    if (const char *e = getenv("WWHD_TEST_DRC_KEY"))
-      for (const char *p = e; *p;) {
-        f.push_back(strtoull(p, (char **)&p, 10));
-        while (*p == ',') p++;
-      }
-    return f;
-  }();
+  static const std::vector<uint64_t> frames = test_frames("WWHD_TEST_DRC_KEY");
   static size_t i = 0;
-  if (i < frames.size() && frame_count() >= frames[i]) {
-    i++;
+  if (test_frame_due(frames, i)) {
     LOG("[display] test: Ctrl+G at frame %llu", (unsigned long long)frame_count());
     ::hostui::toggle_drc();
   }
 }
 
-// full screen: F11 or Alt+Enter toggles the focused window (TV or GamePad)
+// full screen (the TV window's is remembered for the next start: hostui::tv_fullscreen_changed)
+static void toggle_fullscreen(SDL_Window* window) {
+  const bool full = (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) != 0;
+  const char* which = window == R.drc.window ? "GamePad window" : "TV window";
+  if (!SDL_SetWindowFullscreen(window, !full))
+    LOG("[display] %s: switching to %s failed: %s", which, full ? "windowed" : "full screen", SDL_GetError());
+  else
+    LOG("[display] %s %s", which, full ? "windowed" : "full screen");
+  if (window == R.tv.window)
+    ::hostui::tv_fullscreen_changed();
+}
+// F11 or Alt+Enter toggles the focused window (TV or GamePad)
 static bool fullscreen_key(const SDL_Event& event) {
   if (event.type != SDL_EVENT_KEY_DOWN || event.key.repeat) return false;
   const bool f11 = event.key.scancode == SDL_SCANCODE_F11 && !(event.key.mod & (SDL_KMOD_CTRL | SDL_KMOD_GUI));
@@ -2057,14 +2092,18 @@ static bool fullscreen_key(const SDL_Event& event) {
                         (event.key.mod & SDL_KMOD_ALT);
   if (!f11 && !altEnter) return false;
   SDL_Window* window = SDL_GetWindowFromID(event.key.windowID);
-  if (!window) window = R.tv.window;
-  const bool full = (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) != 0;
-  const char* which = window == R.drc.window ? "GamePad window" : "TV window";
-  if (!SDL_SetWindowFullscreen(window, !full))
-    LOG("[display] %s: switching to %s failed: %s", which, full ? "windowed" : "full screen", SDL_GetError());
-  else
-    LOG("[display] %s %s", which, full ? "windowed" : "full screen");
+  toggle_fullscreen(window ? window : R.tv.window);
   return true;
+}
+// debug: WWHD_TEST_FULLSCREEN_KEY=3500,3700 simulates F11 on the TV window at those frames (with
+// WWHD_HIDDEN_WINDOWS the window stays hidden: SDL only notes the state for when it is shown)
+static void test_fullscreen_key() {
+  static const std::vector<uint64_t> frames = test_frames("WWHD_TEST_FULLSCREEN_KEY");
+  static size_t i = 0;
+  if (test_frame_due(frames, i)) {
+    LOG("[display] test: F11 at frame %llu", (unsigned long long)frame_count());
+    toggle_fullscreen(R.tv.window);
+  }
 }
 
 // Closing the TV window ends the game. SDL only sends SDL_EVENT_QUIT once every window is closed, so
@@ -2106,6 +2145,9 @@ void run_main_loop() {
             s->height = event.window.data2;
             s->resize = true;
           }
+          if (s == &R.tv && (event.type == SDL_EVENT_WINDOW_ENTER_FULLSCREEN ||
+                             event.type == SDL_EVENT_WINDOW_LEAVE_FULLSCREEN))
+            ::hostui::tv_fullscreen_changed();  // also when the window manager switched it
           if (event.type == SDL_EVENT_WINDOW_MINIMIZED)
             s->visible = false;
           if (event.type == SDL_EVENT_WINDOW_RESTORED ||
@@ -2116,6 +2158,7 @@ void run_main_loop() {
     input::update();
     ::hostui::run_posted();  // option changes from the settings overlay (render thread)
     test_drc_key();
+    test_fullscreen_key();
     if (const int m = gfx::display_test_mode(frame_count()); m >= 0)
       ::hostui::set_drc_mode(m);
     overlay::set_density(SDL_GetWindowPixelDensity(R.tv.window));
